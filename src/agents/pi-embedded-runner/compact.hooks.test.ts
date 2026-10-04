@@ -991,6 +991,81 @@ describe("compactEmbeddedPiSessionDirect hooks", () => {
     expect(tokensAfter).toBe(30);
   });
 
+  // Regression: a compaction that reclaims nothing used to be SILENT. The sanity check
+  // returns `undefined` when the post estimate exceeds the baseline, and
+  // `CompactionResult.tokensAfter` is optional, so the one signal that says "this pass
+  // was a no-op" was discarded. A session could then compact repeatedly, reclaim
+  // nothing, and die of context overflow with no log line naming the cause
+  // (production: htb-cval-5163).
+  it("reports an implausible post-compaction estimate instead of silently dropping it", () => {
+    estimateTokensMock.mockImplementation(() => 500);
+    const onImplausible = vi.fn();
+
+    const tokensAfter = compactTesting.estimateTokensAfterCompaction({
+      messagesAfter: [{ role: "user", content: "grew" }] as AgentMessage[],
+      observedTokenCount: 100,
+      fullSessionTokensBefore: 100,
+      estimateTokensFn: estimateTokensMock as (message: AgentMessage) => number,
+      onImplausible,
+    });
+
+    // Return contract is deliberately unchanged: still withheld, now audible.
+    expect(tokensAfter).toBeUndefined();
+    expect(onImplausible).toHaveBeenCalledTimes(1);
+    expect(onImplausible).toHaveBeenCalledWith({
+      tokensAfter: 500,
+      baseline: 100,
+      baselineSource: "observed",
+      toleranceMultiplier: 1,
+    });
+  });
+
+  it("does not report when compaction genuinely reclaimed", () => {
+    estimateTokensMock.mockImplementation(() => 30);
+    const onImplausible = vi.fn();
+
+    const tokensAfter = compactTesting.estimateTokensAfterCompaction({
+      messagesAfter: [{ role: "user", content: "kept" }] as AgentMessage[],
+      observedTokenCount: 100,
+      fullSessionTokensBefore: 100,
+      estimateTokensFn: estimateTokensMock as (message: AgentMessage) => number,
+      onImplausible,
+    });
+
+    expect(tokensAfter).toBe(30);
+    expect(onImplausible).not.toHaveBeenCalled();
+  });
+
+  // An ESTIMATED baseline carries tokenizer error, so it keeps a 10% tolerance; an
+  // OBSERVED (provider-billed) baseline is exact and gets none. This asserts the
+  // distinction survives refactoring — collapsing them would either spam warnings on
+  // estimator noise or miss real growth.
+  it("applies the 10% tolerance only to an estimated baseline", () => {
+    estimateTokensMock.mockImplementation(() => 105);
+    const onEstimated = vi.fn();
+    const estimated = compactTesting.estimateTokensAfterCompaction({
+      messagesAfter: [{ role: "user", content: "x" }] as AgentMessage[],
+      fullSessionTokensBefore: 100,
+      estimateTokensFn: estimateTokensMock as (message: AgentMessage) => number,
+      onImplausible: onEstimated,
+    });
+    // 105 <= 100 * 1.1 -> within tolerance, reported as a real value
+    expect(estimated).toBe(105);
+    expect(onEstimated).not.toHaveBeenCalled();
+
+    const onObserved = vi.fn();
+    const observed = compactTesting.estimateTokensAfterCompaction({
+      messagesAfter: [{ role: "user", content: "x" }] as AgentMessage[],
+      observedTokenCount: 100,
+      fullSessionTokensBefore: 100,
+      estimateTokensFn: estimateTokensMock as (message: AgentMessage) => number,
+      onImplausible: onObserved,
+    });
+    // 105 > 100 * 1 -> implausible against an exact baseline
+    expect(observed).toBeUndefined();
+    expect(onObserved).toHaveBeenCalledTimes(1);
+  });
+
   it("skips sync in await mode when postCompactionForce is false", async () => {
     const sync = vi.fn(async () => {});
     getMemorySearchManagerMock.mockResolvedValue({ manager: { sync } });

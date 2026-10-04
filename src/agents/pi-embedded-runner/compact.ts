@@ -1226,9 +1226,12 @@ async function compactEmbeddedPiSessionDirectOnce(
           });
           const { messageCountOriginal } = beforeHookMetrics;
           const diagEnabled = log.isEnabled("debug");
-          const preMetrics = diagEnabled
-            ? summarizeCompactionMessages(session.messages)
-            : undefined;
+          // Reclaim measurement is ALWAYS computed, never debug-gated. "Did compaction
+          // reclaim anything?" is precisely the question you need answered when a run
+          // dies of context overflow, and a debug-gated metric is absent exactly when it
+          // matters. `summarizeCompactionMessages` is an in-memory O(messages) scan and
+          // compaction already costs an LLM round-trip, so two scans are negligible.
+          const preMetrics = summarizeCompactionMessages(session.messages);
           if (diagEnabled && preMetrics) {
             log.debug(
               `[compaction-diag] start runId=${runId} sessionKey=${params.sessionKey ?? params.sessionId} ` +
@@ -1318,6 +1321,27 @@ async function compactEmbeddedPiSessionDirectOnce(
             observedTokenCount,
             fullSessionTokensBefore,
             estimateTokensFn: estimateTokens,
+            // Compaction that does not reduce the transcript must be audible. Without
+            // this the estimate is dropped and `tokensAfter` is simply absent, so a
+            // session can compact repeatedly, reclaim nothing, and die of context
+            // overflow with nothing in the log naming the cause.
+            onImplausible: (info) => {
+              log.warn(
+                `[compaction] no reclaim: post-compaction estimate ${info.tokensAfter} exceeds ` +
+                  `${info.baselineSource} baseline ${info.baseline} ` +
+                  `(tolerance x${info.toleranceMultiplier}) runId=${runId} trigger=${trigger} ` +
+                  `attempt=${attempt}/${maxAttempts} — tokensAfter withheld as implausible`,
+                {
+                  event: "compaction_no_reclaim",
+                  runId,
+                  trigger,
+                  attempt,
+                  tokensAfter: info.tokensAfter,
+                  baseline: info.baseline,
+                  baselineSource: info.baselineSource,
+                },
+              );
+            },
           });
           const messageCountAfter = session.messages.length;
           const compactedCount = Math.max(0, messageCountCompactionInput - messageCountAfter);
@@ -1375,9 +1399,7 @@ async function compactEmbeddedPiSessionDirectOnce(
               });
             }
           }
-          const postMetrics = diagEnabled
-            ? summarizeCompactionMessages(session.messages)
-            : undefined;
+          const postMetrics = summarizeCompactionMessages(session.messages);
           if (diagEnabled && preMetrics && postMetrics) {
             log.debug(
               `[compaction-diag] end runId=${runId} sessionKey=${params.sessionKey ?? params.sessionId} ` +
@@ -1391,6 +1413,39 @@ async function compactEmbeddedPiSessionDirectOnce(
                 `delta.toolResultChars=${postMetrics.toolResultChars - preMetrics.toolResultChars} ` +
                 `delta.estTokens=${typeof preMetrics.estTokens === "number" && typeof postMetrics.estTokens === "number" ? postMetrics.estTokens - preMetrics.estTokens : "unknown"}`,
             );
+          }
+          // ALWAYS-ON reclaim assertion. The debug line above is for humans reading a
+          // verbose log; this is the one that fires in production when compaction
+          // completed but moved nothing. Measured on the message bodies we control —
+          // the system prompt and tool schemas are an incompressible floor that
+          // compaction cannot touch, so a non-positive delta here means this pass was
+          // a no-op, not merely that the prompt is still large.
+          {
+            const deltaMessages = postMetrics.messages - preMetrics.messages;
+            const deltaEstTokens =
+              typeof preMetrics.estTokens === "number" && typeof postMetrics.estTokens === "number"
+                ? postMetrics.estTokens - preMetrics.estTokens
+                : undefined;
+            const reclaimedNothing =
+              deltaMessages >= 0 && (deltaEstTokens === undefined || deltaEstTokens >= 0);
+            if (reclaimedNothing) {
+              log.warn(
+                `[compaction] completed without reclaiming: runId=${runId} trigger=${trigger} ` +
+                  `attempt=${attempt}/${maxAttempts} delta.messages=${deltaMessages} ` +
+                  `delta.estTokens=${deltaEstTokens ?? "unknown"} ` +
+                  `delta.toolResultChars=${postMetrics.toolResultChars - preMetrics.toolResultChars} ` +
+                  `— repeated passes will not recover context; expect overflow`,
+                {
+                  event: "compaction_reclaimed_nothing",
+                  runId,
+                  trigger,
+                  attempt,
+                  deltaMessages,
+                  deltaEstTokens,
+                  deltaToolResultChars: postMetrics.toolResultChars - preMetrics.toolResultChars,
+                },
+              );
+            }
           }
           await runAfterCompactionHooks({
             hookRunner,
