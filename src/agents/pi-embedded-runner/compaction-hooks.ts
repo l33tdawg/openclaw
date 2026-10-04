@@ -244,17 +244,44 @@ export function estimateTokensAfterCompaction(params: {
   observedTokenCount?: number;
   fullSessionTokensBefore: number;
   estimateTokensFn: (message: AgentMessage) => number;
+  /**
+   * Called when the post-compaction estimate is implausible, i.e. compaction did
+   * not reduce the transcript. Optional so existing callers are unaffected.
+   *
+   * WHY THIS EXISTS: the sanity check below returns `undefined` when the estimate
+   * exceeds the baseline, and `CompactionResult.tokensAfter` is optional, so the
+   * one signal that says "compaction reclaimed nothing" was being DISCARDED
+   * rather than reported — silent failure by construction. A run can then compact
+   * repeatedly, reclaim nothing each time, and die of context overflow with no log
+   * line saying why. Observed in production (htb-cval-5163: repeated in-attempt
+   * compaction, then `exhausted provider overflow recovery`).
+   *
+   * The return contract is deliberately unchanged — an implausible estimate is
+   * still not reported as a real number. This only makes the discard audible.
+   */
+  onImplausible?: (info: {
+    tokensAfter: number;
+    baseline: number;
+    baselineSource: "observed" | "estimated";
+    toleranceMultiplier: number;
+  }) => void;
 }) {
   const tokensAfter = estimateTokenCountSafe(params.messagesAfter, params.estimateTokensFn);
   if (tokensAfter === undefined) {
     return undefined;
   }
   const sanityCheckBaseline = params.observedTokenCount ?? params.fullSessionTokensBefore;
-  if (
-    sanityCheckBaseline > 0 &&
-    tokensAfter >
-      (params.observedTokenCount !== undefined ? sanityCheckBaseline : sanityCheckBaseline * 1.1)
-  ) {
+  const baselineSource = params.observedTokenCount !== undefined ? "observed" : "estimated";
+  // An observed (provider-billed) baseline is exact, so any growth is implausible.
+  // An estimated baseline carries tokenizer error, hence the 10% tolerance.
+  const toleranceMultiplier = baselineSource === "observed" ? 1 : 1.1;
+  if (sanityCheckBaseline > 0 && tokensAfter > sanityCheckBaseline * toleranceMultiplier) {
+    params.onImplausible?.({
+      tokensAfter,
+      baseline: sanityCheckBaseline,
+      baselineSource,
+      toleranceMultiplier,
+    });
     return undefined;
   }
   return tokensAfter;
